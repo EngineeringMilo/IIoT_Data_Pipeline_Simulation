@@ -1,0 +1,213 @@
+version: "3.9"
+
+networks:
+  iiot-net:
+    driver: bridge
+
+volumes:
+  redpanda_data:
+  timescale_data:
+  azurite_data:
+
+services:
+
+  ##################################
+  #           REDPANDA
+  ##################################
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command: >
+      redpanda start --overprovisioned --smp 1 --memory 1G
+      --reserve-memory 0M --node-id 0 --check=false
+      --kafka-addr PLAINTEXT://0.0.0.0:9092
+      --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    networks:
+      - iiot-net
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ##################################
+  #       REDPANDA CONSOLE
+  ##################################
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - iiot-net
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: "redpanda:9092"
+
+  ##################################
+  #            TIMESCALEDB
+  ##################################
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    networks:
+      - iiot-net
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: iiot
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "admin","-d","iiot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ##################################
+  #           FLINK JOBMANAGER
+  ##################################
+  flink-jobmanager:
+    image: flink:latest
+    networks:
+      - iiot-net
+    command: jobmanager
+    build:
+      context: ./flink_jobs
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.heap.size: 1024m
+    volumes:
+      - ./flink_jobs/usr_jobs:/opt/flink/usr_jobs
+    depends_on:
+      - timescaledb
+      - redpanda
+
+  ##################################
+  #          FLINK TASKMANAGER
+  ##################################
+  flink-taskmanager:
+    image: flink:latest
+    networks:
+      - iiot-net
+    command: taskmanager
+    scale: 1
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        taskmanager.heap.size: 1024m
+    volumes:
+      - ./flink_jobs/usr_jobs:/opt/flink/usr_jobs
+    build:
+      context: ./flink_jobs
+      dockerfile: Dockerfile
+    depends_on:
+      - flink-jobmanager
+
+  ##################################
+  #          SPARK MASTER
+  ##################################
+  spark-master:
+    image: apache/spark:latest
+    container_name: spark-master
+    networks:
+      - iiot-net
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "7077:7077"
+    volumes:
+      - ./spark_jobs:/opt/spark/jobs
+
+  ##################################
+  #          SPARK WORKER
+  ##################################
+  spark-worker:
+    image: apache/spark:latest
+    container_name: spark-worker
+    networks:
+      - iiot-net
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark_jobs:/opt/spark/jobs
+
+  ##################################
+  #             AZURITE
+  ##################################
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    networks:
+      - iiot-net
+    ports:
+      - "10000:10000"
+    volumes:
+      - azurite_data:/data
+    command: >
+      azurite-blob --blobHost 0.0.0.0 --location /data
+
+  ##################################
+  #             PREFECT
+  ##################################
+  prefect:
+    image: prefecthq/prefect:2-latest
+    networks:
+      - iiot-net
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  ################################
+  # Ingestion Service
+  ################################
+  # Docker will use the Dockerfile inside ./ingestion to build the image.
+  ingestion-service:
+    build:
+      context: ./ingestion
+    networks:
+      - iiot-net
+    environment:
+      BROKER: "redpanda:9092"
+      INTERVAL: 2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+  ################################
+  # Stream Processing Service
+  ################################
+  # Docker will use the Dockerfile inside ./flink_jobs to build the image.
+  flink-aggregation:
+    command: python /opt/flink/usr_jobs/sensor_aggregation.py
+    volumes:
+      - ./flink_jobs/usr_jobs:/opt/flink/usr_jobs
+    build:
+      context: ./flink_jobs
+    networks:
+      - iiot-net
+    environment:
+      environment:
+      BROKER: "redpanda:9092"
+      TIMESCALE_HOST: "timescaledb"
+      TIMESCALE_PORT: 5432
+      TIMESCALE_DB: "iiot"
+      TIMESCALE_USER: "admin"
+      TIMESCALE_PASS: "admin"
+    depends_on:
+      redpanda:
+        condition: service_healthy

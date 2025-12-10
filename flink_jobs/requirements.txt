@@ -1,0 +1,4 @@
+apache-flink==1.18
+apache-flink-libraries==1.18
+kafka-python==2.0.2
+psycopg2-binary==2.9.9
