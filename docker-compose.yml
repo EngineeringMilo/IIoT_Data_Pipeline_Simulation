@@ -192,6 +192,9 @@ services:
   # Stream Processing Service
   ################################
   # Docker will use the Dockerfile inside ./flink_jobs to build the image.
+  #command: python /opt/flink/usr_jobs/sensor_aggregation.py
+    #- ./flink_jobs/lib:/opt/flink/lib
+    #command: tail -f /dev/null
   flink-aggregation:
     command: python /opt/flink/usr_jobs/sensor_aggregation.py
     volumes:
@@ -201,7 +204,6 @@ services:
     networks:
       - iiot-net
     environment:
-      environment:
       BROKER: "redpanda:9092"
       TIMESCALE_HOST: "timescaledb"
       TIMESCALE_PORT: 5432

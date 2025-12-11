@@ -1,59 +1,101 @@
-from pyflink.table import TableEnvironment, EnvironmentSettings
+import json
 import time
+import socket
+from pyflink.common import WatermarkStrategy
+from pyflink.common.serialization import SimpleStringSchema
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
 
-# 1. Create Table Environment in streaming mode
-env_settings = EnvironmentSettings.in_streaming_mode()
-t_env = TableEnvironment.create(env_settings)
+# Thresholds for alerts
+THRESHOLDS = {
+    "temperature": 100.0,
+    "pressure": 1000.0,
+    "power_load": 100.0,
+    "vibration": 3.0
+}
 
-# 2. Define Redpanda/Kafka source table
-t_env.execute_sql("""
-CREATE TABLE machine_sensors (
-    machine_id STRING,
-    machine_type STRING,
-    location STRING,
-    ts TIMESTAMP(3),
-    readings ROW<
-        temperature DOUBLE,
-        vibration DOUBLE,
-        power_load DOUBLE
-    >,
-    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
-) WITH (
-    'connector' = 'kafka',
-    'topic' = 'machine-sensors',
-    'properties.bootstrap.servers' = 'redpanda:9092',
-    'properties.group.id' = 'flink-test-group',
-    'scan.startup.mode' = 'earliest-offset',
-    'format' = 'json'
-)
-""")
+# Broker configuration
+BROKER_HOST = "redpanda"
+BROKER_PORT = 9092
+KAFKA_TOPIC = "machine-sensors"
 
-# 3. Define a print sink for testing
-t_env.execute_sql("""
-CREATE TABLE print_sink (
-    machine_id STRING,
-    machine_type STRING,
-    temperature DOUBLE,
-    vibration DOUBLE,
-    power_load DOUBLE
-) WITH (
-    'connector' = 'print'
-)
-""")
+def wait_for_broker(host: str, port: int, retry_interval: float = 2.0):
+    """
+    Wait until the Kafka/Redpanda broker is reachable.
+    """
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                print(f"{host}:{port} is reachable. Starting Flink job...")
+                return
+        except Exception:
+            print(f"Waiting for broker {host}:{port}...")
+            time.sleep(retry_interval)
 
-# 4. Transform and insert into print sink
-result=t_env.execute_sql("""
-INSERT INTO print_sink
-SELECT
-    machine_id,
-    machine_type,
-    readings.temperature AS temperature,
-    readings.vibration AS vibration,
-    readings.power_load AS power_load
-FROM machine_sensors
-""")
+def parse_and_filter(value: str) -> str | None:
+    """
+    Parse JSON message, check thresholds, and return alert JSON if any exceeded.
+    """
+    data = json.loads(value)
+    machine_id = data.get("machine_id")
+    machine_type = data.get("machine_type")
+    location = data.get("location")
+    timestamp = data.get("timestamp")
+    readings = data.get("readings", {})
 
-print("Streaming job submitted. Container will stay alive...")
+    alerts = {}
+    for sensor, threshold in THRESHOLDS.items():
+        sensor_value = readings.get(sensor)
+        if sensor_value is not None and sensor_value > threshold:
+            alerts[sensor] = sensor_value
 
-while True:
-    time.sleep(60)
+    if alerts:
+        return json.dumps({
+            "machine_id": machine_id,
+            "machine_type": machine_type,
+            "location": location,
+            "alerts": alerts,
+            "timestamp": timestamp
+        })
+
+    return None
+
+def main():
+    # Wait for Redpanda broker to be ready
+    wait_for_broker(BROKER_HOST, BROKER_PORT)
+
+    # Create Flink streaming environment
+    env = StreamExecutionEnvironment.get_execution_environment()
+
+    # Make sure the Flink Kafka connector JAR is mounted in the container
+    env.add_jars("file:///opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar")
+
+    # Kafka source configuration
+    properties = {
+        "bootstrap.servers": f"{BROKER_HOST}:{BROKER_PORT}",
+        "group.id": "iot-sensors"
+    }
+
+    kafka_source = KafkaSource.builder() \
+        .set_topics(KAFKA_TOPIC) \
+        .set_properties(properties) \
+        .set_starting_offsets(KafkaOffsetsInitializer.latest()) \
+        .set_value_only_deserializer(SimpleStringSchema()) \
+        .build()
+
+    # Create data stream from Kafka source
+    stream = env.from_source(
+        kafka_source,
+        WatermarkStrategy.no_watermarks(),
+        "Kafka Sensors Source"
+    )
+
+    # Parse, filter, and print alerts
+    alerts = stream.map(parse_and_filter).filter(lambda x: x is not None)
+    alerts.print()
+
+    # Execute the Flink job
+    env.execute("Sensor Alerts Consumer")
+
+if __name__ == "__main__":
+    main()
