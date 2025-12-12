@@ -1,10 +1,12 @@
 import json
 import time
 import socket
-from pyflink.common import WatermarkStrategy
+from pyflink.common import WatermarkStrategy,Types
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
+from pyflink.datastream.functions import AggregateFunction
+from pyflink.datastream.window import Time, TumblingProcessingTimeWindows, SlidingProcessingTimeWindows
 
 # Thresholds for alerts
 THRESHOLDS = {
@@ -60,6 +62,40 @@ def parse_and_filter(value: str) -> str | None:
 
     return None
 
+def flatten_readings(record_str):
+    record=json.loads(record_str)
+    readings = record.get("readings", {})
+    machine_id = record.get("machine_id")
+    timestamp = record.get("timestamp")
+    for sensor_name, value in readings.items():
+        yield (machine_id, sensor_name, float(value), timestamp)
+
+# AggregateFunction to compute sum, count, min, max
+class StatsAgg(AggregateFunction):
+
+    def create_accumulator(self):
+        # accumulator: (sum, count, min, max)
+        return (0.0, 0, float('inf'), float('-inf'))
+
+    def add(self, value, accumulator):
+        val = value[2]
+        s, c, mn, mx = accumulator
+        s += val
+        c += 1
+        mn = min(mn, val)
+        mx = max(mx, val)
+        return (s, c, mn, mx)
+
+    def get_result(self, accumulator):
+        s, c, mn, mx = accumulator
+        avg = s / c if c > 0 else 0
+        return (avg, mn, mx, c)
+
+    def merge(self, a, b):
+        s1, c1, mn1, mx1 = a
+        s2, c2, mn2, mx2 = b
+        return (s1+s2, c1+c2, min(mn1, mn2), max(mx1, mx2))
+
 def main():
     # Wait for Redpanda broker to be ready
     wait_for_broker(BROKER_HOST, BROKER_PORT)
@@ -90,12 +126,48 @@ def main():
         "Kafka Sensors Source"
     )
 
-    # Parse, filter, and print alerts
-    alerts = stream.map(parse_and_filter).filter(lambda x: x is not None)
-    alerts.print()
+    # Flatten the readings
+    flat_stream = stream.flat_map(flatten_readings, 
+                                  output_type=Types.TUPLE([
+                                      Types.STRING(),  # machine_id
+                                      Types.STRING(),  # sensor_name
+                                      Types.FLOAT(),   # value
+                                      Types.STRING()   # timestamp
+                                  ]))
 
-    # Execute the Flink job
-    env.execute("Sensor Alerts Consumer")
+    # Tumbling window: 1 minute
+    tumbling_agg = (
+        flat_stream
+        .key_by(lambda x: (x[0], x[1]))  # key: machine_id, sensor_name
+        .window(TumblingProcessingTimeWindows.of(Time.minutes(1)))
+        .aggregate(StatsAgg(),
+                   output_type=Types.TUPLE([
+                       Types.FLOAT(),  # avg
+                       Types.FLOAT(),  # min
+                       Types.FLOAT(),  # max
+                       Types.INT()     # count
+                   ]))
+    )
+    tumbling_agg.map(lambda x: f"TUMBLING WINDOW AGG: {x}").print()
+
+    # Sliding window: 1 minute sliding every 30s
+    sliding_agg = (
+        flat_stream
+        .key_by(lambda x: (x[0], x[1]))
+        .window(SlidingProcessingTimeWindows.of(Time.minutes(1), Time.seconds(30)))
+        .aggregate(StatsAgg(),
+                   output_type=Types.TUPLE([
+                       Types.FLOAT(),  # avg
+                       Types.FLOAT(),  # min
+                       Types.FLOAT(),  # max
+                       Types.INT()     # count
+                   ]))
+    )
+    sliding_agg.map(lambda x: f"SLIDING WINDOW AGG: {x}").print()
+    alerts = stream.map(parse_and_filter).filter(lambda x: x is not None)
+    #alerts.print()
+
+    env.execute("Sensor Window Aggregations")
 
 if __name__ == "__main__":
     main()
